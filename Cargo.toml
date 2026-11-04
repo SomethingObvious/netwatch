@@ -1,0 +1,13 @@
+[package]
+name = "netwatch"
+version = "1.0.0"
+edition = "2021"
+description = "A desktop board that says when packet loss means it's time to restart the router"
+license = "MIT"
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1
