@@ -26,12 +26,14 @@ struct Min {
 }
 
 impl Min {
-    fn lost(&self) -> u8 {
-        if self.sent[0] == 0 || self.sent[1] == 0 { return 0 }
-        self.lost[0].min(self.lost[1])
+    fn lost(&self) -> u16 {
+        let (a, b) = (self.lost[0] as u16, self.lost[1] as u16);
+        if a == 0 || b == 0 { return 0 }
+        (a + b).min(4 * a.min(b))
     }
-    fn sent(&self) -> u8 {
-        self.sent[0].max(self.sent[1])
+    fn sent(&self) -> u16 {
+        if self.sent[0] == 0 || self.sent[1] == 0 { return 0 }
+        self.sent[0] as u16 + self.sent[1] as u16
     }
     fn replies(&self, i: usize) -> u32 {
         (self.sent[i] - self.lost[i]) as u32
@@ -68,7 +70,7 @@ fn verdict(hour: &[Min; 60], now: u64) -> Verdict {
         v.measured += 1;
         let lost = m.lost();
         if lost > 0 { v.lossy += 1 }
-        if lost as u16 >= get(settings::BAD_LOST) {
+        if lost >= get(settings::BAD_LOST) {
             v.bad += 1;
             last_bad = last_bad.max(Some(m.stamp));
         }
@@ -188,7 +190,7 @@ fn router_address() -> Option<u32> {
 
 const TIMED_OUT: u32 = 11010;
 const HOST_UNREACHABLE: u32 = 11003;
-const RESET_OFFLINE_ROUNDS: u32 = 30;
+const RESET_OFFLINE: Duration = Duration::from_secs(30);
 const SYNC_GRACE: Duration = Duration::from_secs(180);
 
 fn dns_query(id: u16) -> [u8; 29] {
@@ -200,68 +202,22 @@ fn dns_query(id: u16) -> [u8; 29] {
     q
 }
 
-fn lookups(socket: &UdpSocket, id: u16) -> [Option<Option<u32>>; 2] {
-    let start = Instant::now();
-    let to = |i: usize| Ipv4Addr::from(HOSTS[i]);
-    let mut result = [None; 2];
-    for i in 0..2 {
-        if socket.send_to(&dns_query(id.wrapping_add(i as u16)), (to(i), 53)).is_ok() { result[i] = Some(None) }
-    }
-    let mut buf = [0u8; 512];
-    while result.contains(&Some(None)) {
-        let left = Duration::from_millis(900).saturating_sub(start.elapsed());
-        if left.is_zero() || socket.set_read_timeout(Some(left)).is_err() { break }
-        match socket.recv_from(&mut buf) {
-            Ok((n, from)) if n >= 2 => {
-                let reply = u16::from_be_bytes([buf[0], buf[1]]);
-                for i in 0..2 {
-                    if reply == id.wrapping_add(i as u16) && from.ip() == to(i) && result[i] == Some(None) {
-                        result[i] = Some(Some(start.elapsed().as_millis() as u32));
-                    }
-                }
-            }
-            Ok(_) => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
-            Err(_) => break,
-        }
-    }
-    result
-}
+const LOOKUP_EVERY: Duration = Duration::from_millis(500);
+const LOOKUP_WAIT: Duration = Duration::from_millis(1000);
 
-fn pinger() {
+static ROUTER_SEEN: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn router_pinger() {
     unsafe {
         let mut icmp = IcmpCreateFile();
         while icmp as isize == -1 {
             std::thread::sleep(Duration::from_secs(1));
             icmp = IcmpCreateFile();
         }
-        let socket = loop {
-            match UdpSocket::bind(("0.0.0.0", 0)) {
-                Ok(s) => break s,
-                Err(_) => std::thread::sleep(Duration::from_secs(1)),
-            }
-        };
-        let mut id = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as u16);
         let data = [0u8; 8];
         let mut reply = [0u64; 16];
-        let mut offline_rounds = 0;
-        let mut syncing_until: Option<Instant> = None;
-        let mut saved = now_min();
         loop {
-            if now_min() != saved {
-                saved = now_min();
-                save_hour();
-            }
             let start = Instant::now();
-            let mut offline = true;
-            id = id.wrapping_add(2);
-            for (i, answer) in lookups(&socket, id).into_iter().enumerate() {
-                let Some(ms) = answer else { continue };
-                offline = false;
-                if ms.is_some() { syncing_until = None }
-                if ms.is_none() && syncing_until.is_some_and(|t| Instant::now() < t) { continue }
-                record(i, ms.is_none(), ms.unwrap_or(0));
-            }
             if let Some(addr) = router_address() {
                 let n = IcmpSendEcho(icmp, addr, data.as_ptr().cast(), 8, null(),
                     reply.as_mut_ptr().cast(), size_of::<[u64; 16]>() as u32, 500);
@@ -271,17 +227,78 @@ fn pinger() {
                     matches!(GetLastError(), TIMED_OUT | HOST_UNREACHABLE).then_some(true)
                 };
                 if let Some(lost) = lost {
-                    offline = false;
+                    *ROUTER_SEEN.lock().unwrap() = Some(Instant::now());
                     record(ROUTER, lost, if lost { 0 } else { reply[1] as u32 });
                 }
             }
-            offline_rounds = if offline { offline_rounds + 1 } else { 0 };
-            if offline_rounds == RESET_OFFLINE_ROUNDS {
-                *HOUR.lock().unwrap() = [EMPTY; 60];
-                syncing_until = Some(Instant::now() + SYNC_GRACE);
-            }
-            PostMessageW(WINDOW.load(Relaxed) as H, WM_APP, 0, 0);
             std::thread::sleep(Duration::from_secs(1).saturating_sub(start.elapsed()));
+        }
+    }
+}
+
+fn pinger() {
+    std::thread::spawn(router_pinger);
+    let socket = loop {
+        match UdpSocket::bind(("0.0.0.0", 0)) {
+            Ok(s) => break s,
+            Err(_) => std::thread::sleep(Duration::from_secs(1)),
+        }
+    };
+    let to = |i: usize| Ipv4Addr::from(HOSTS[i]);
+    let mut id = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as u16);
+    let mut pending: Vec<(u16, usize, Instant)> = Vec::new();
+    let mut next_send = Instant::now();
+    let mut offline_since: Option<Instant> = None;
+    let mut syncing_until: Option<Instant> = None;
+    let mut saved = now_min();
+    let mut buf = [0u8; 512];
+    loop {
+        let now = Instant::now();
+        if now >= next_send {
+            next_send = (next_send + LOOKUP_EVERY).max(now);
+            if now_min() != saved {
+                saved = now_min();
+                save_hour();
+            }
+            let mut sent_any = false;
+            for i in 0..2 {
+                id = id.wrapping_add(1);
+                if socket.send_to(&dns_query(id), (to(i), 53)).is_ok() {
+                    pending.push((id, i, now));
+                    sent_any = true;
+                }
+            }
+            let router_seen = ROUTER_SEEN.lock().unwrap().is_some_and(|t| now - t < Duration::from_secs(3));
+            if sent_any || router_seen {
+                offline_since = None;
+            } else if offline_since.is_none() {
+                offline_since = Some(now);
+            }
+            if offline_since.is_some_and(|t| now - t >= RESET_OFFLINE) {
+                *HOUR.lock().unwrap() = [EMPTY; 60];
+                syncing_until = Some(now + SYNC_GRACE);
+                offline_since = None;
+            }
+            unsafe { PostMessageW(WINDOW.load(Relaxed) as H, WM_APP, 0, 0); }
+        }
+        let syncing = syncing_until.is_some_and(|t| now < t);
+        pending.retain(|&(_, host, at)| {
+            if now - at < LOOKUP_WAIT { return true }
+            if !syncing { record(host, true, 0) }
+            false
+        });
+        let wait = next_send.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+        if socket.set_read_timeout(Some(wait)).is_err() { continue }
+        match socket.recv_from(&mut buf) {
+            Ok((n, from)) if n >= 2 => {
+                let reply = u16::from_be_bytes([buf[0], buf[1]]);
+                if let Some(k) = pending.iter().position(|&(pid, host, _)| pid == reply && from.ip() == to(host)) {
+                    let (_, host, at) = pending.swap_remove(k);
+                    syncing_until = None;
+                    record(host, false, at.elapsed().as_millis() as u32);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -716,7 +733,7 @@ unsafe fn draw_board(p: &Painter, hour: &[Min; 60], now: u64, board: &Board, w: 
         let minute = hour[(m % 60) as usize];
         let colour = if minute.stamp != m || minute.sent() == 0 { rgb(17, 17, 19) }
             else if minute.lost() == 0 { rgb(48, 50, 54) }
-            else if (minute.lost() as u16) < get(settings::BAD_LOST) { LABEL }
+            else if minute.lost() < get(settings::BAD_LOST) { LABEL }
             else if s == State::Reset { RED } else { AMBER };
         let x = x0 + i as i32 * width / 60;
         let x1 = x0 + (i as i32 + 1) * width / 60 - gap;
@@ -767,8 +784,8 @@ fn sample_hour(state: &str, now: u64) -> [Min; 60] {
         };
         let ping = if state == "reset" { 70 } else { 31 };
         hour[(m % 60) as usize] = Min {
-            stamp: m, sent: [60; 3], lost: [lost[0], lost[1], 0],
-            rtt: [ping * (60 - lost[0] as u32), ping * (60 - lost[1] as u32), 3 * 60],
+            stamp: m, sent: [120, 120, 60], lost: [lost[0], lost[1], 0],
+            rtt: [ping * (120 - lost[0] as u32), ping * (120 - lost[1] as u32), 3 * 60],
         };
     }
     hour
@@ -1238,7 +1255,11 @@ mod tests {
         assert_eq!(one.lost(), 0);
 
         let router = Min { stamp: now, sent: [60; 3], lost: [6, 7, 30], rtt: [0; 3] };
-        assert_eq!(router.lost(), 6);
+        assert_eq!(router.lost(), 13);
+
+        assert!(minute(now, 120, [3, 3]).lost() >= get(settings::BAD_LOST));
+        assert_eq!(minute(now, 120, [3, 0]).lost(), 0);
+        assert_eq!(minute(now, 120, [120, 1]).lost(), 4);
     }
 
     #[test]
@@ -1307,7 +1328,7 @@ mod tests {
         hour[999 % 60] = minute(999, 41, [0, 2]);
         let back = parse_hour(&hour_text(&hour));
         assert_eq!(hour_text(&back), hour_text(&hour));
-        assert_eq!(back[1000 % 60].lost(), 8);
+        assert_eq!(back[1000 % 60].lost(), 17);
 
         let text = "1000 60 60 60 9 8 0 1530 1560 180\n1001 5 5 5 9 0 0 1 1 1\n1002 60 60\n1003 60 x 60 0 0 0 1 1 1\n";
         let hour = parse_hour(text);
