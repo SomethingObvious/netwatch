@@ -4,7 +4,7 @@ A small desktop board for Windows that tells you whether your internet has been 
 
 ![The board when the line is fine, worth watching, and due for a reset](board.png)
 
-Twice a second it sends a tiny DNS lookup to 1.1.1.1 and 8.8.8.8, and once a second it pings your router. A minute counts as bad when both hosts missed lookups in it and the two together missed five, which is what a burst of a couple of seconds does to a game. The board says RESET after three bad minutes in the hour with one in the last 10. The lookups go over UDP like game traffic, because pings get throttled on their own. A router that answers while the internet doesn't means the loss is past it.
+Twice a second it sends a tiny DNS lookup to 1.1.1.1 and 8.8.8.8, and once a second it pings your router. A minute counts as bad when both hosts missed lookups in it and the two together missed five, which is what a burst of a couple of seconds does to a game. The board says RESET after five bad minutes within 15, since a line that stutters now and then is still playable and one that misses minute after minute isn't. The lookups go over UDP like game traffic, because pings get throttled on their own. A router that answers while the internet doesn't means the loss is past it.
 
 The top row is the verdict, from CLEAN and FINE through WATCH to RESET, then RECOVERY once it has been quiet for a while. Under it are the loss over 5 minutes, the ping to the internet and to the router, and the bad minutes this hour. The bottom strip is the hour, one cell per minute.
 

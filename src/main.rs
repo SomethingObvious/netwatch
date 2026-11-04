@@ -49,32 +49,35 @@ static CLOSED: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, PartialEq)]
 struct Verdict {
     bad: usize,
+    stretch: usize,
     lossy: usize,
     measured: usize,
     recent_bad: bool,
 }
 
 impl Verdict {
-    fn reset(&self) -> bool { self.bad >= get(settings::RESET_AFTER) as usize && self.recent_bad }
+    fn reset(&self) -> bool { self.stretch >= get(settings::RESET_AFTER) as usize && self.recent_bad }
 }
+
+const STRETCH: u64 = 15;
 
 fn in_window(m: &Min, now: u64, span: u64) -> bool {
     m.stamp + span > now && m.stamp <= now
 }
 
 fn verdict(hour: &[Min; 60], now: u64) -> Verdict {
-    let mut v = Verdict { bad: 0, lossy: 0, measured: 0, recent_bad: false };
+    let mut v = Verdict { bad: 0, stretch: 0, lossy: 0, measured: 0, recent_bad: false };
     let measured = || hour.iter().filter(|m| m.sent() > 0 && in_window(m, now, 60));
-    let mut last_bad = None;
+    let mut bad = Vec::new();
     for m in measured() {
         v.measured += 1;
         let lost = m.lost();
         if lost > 0 { v.lossy += 1 }
-        if lost >= get(settings::BAD_LOST) {
-            v.bad += 1;
-            last_bad = last_bad.max(Some(m.stamp));
-        }
+        if lost >= get(settings::BAD_LOST) { bad.push(m.stamp) }
     }
+    v.bad = bad.len();
+    v.stretch = bad.iter().map(|&end| bad.iter().filter(|&&t| t <= end && t + STRETCH > end).count()).max().unwrap_or(0);
+    let last_bad = bad.iter().max().copied();
     if let Some(at) = last_bad {
         v.recent_bad = measured().filter(|m| m.stamp > at).count() < get(settings::RECOVERY) as usize;
     }
@@ -115,7 +118,7 @@ enum State { Measuring, Clean, Fine, Watch, Recovering, Reset }
 
 fn state(v: &Verdict) -> State {
     if v.reset() { State::Reset }
-    else if v.bad >= get(settings::RESET_AFTER) as usize { State::Recovering }
+    else if v.stretch >= get(settings::RESET_AFTER) as usize { State::Recovering }
     else if v.bad > 0 { State::Watch }
     else if v.lossy > 0 { State::Fine }
     else if v.measured > 0 { State::Clean }
@@ -1231,21 +1234,27 @@ mod tests {
         let now = 1000;
         let mut hour = [EMPTY; 60];
         for i in 0..60 { hour[((now - i) % 60) as usize] = minute(now - i, 60, [0, 0]) }
-        assert_eq!(verdict(&hour, now), Verdict { bad: 0, lossy: 0, measured: 60, recent_bad: false });
+        assert_eq!(verdict(&hour, now), Verdict { bad: 0, stretch: 0, lossy: 0, measured: 60, recent_bad: false });
         assert_eq!(state(&verdict(&hour, now)), State::Clean);
 
         hour[(now % 60) as usize] = minute(now, 60, [9, 0]);
         assert_eq!(verdict(&hour, now).lossy, 0);
 
-        for i in 0..3 { hour[((now - i) % 60) as usize] = minute(now - i, 60, [9, 8]) }
+        let mut spread = hour;
+        for i in [0, 1, 2, 17] { spread[((now - i) % 60) as usize] = minute(now - i, 60, [9, 8]) }
+        let v = verdict(&spread, now);
+        assert_eq!((v.bad, v.stretch), (4, 3));
+        assert_eq!(state(&v), State::Watch);
+
+        for i in 0..5 { hour[((now - i) % 60) as usize] = minute(now - i, 60, [9, 8]) }
         let v = verdict(&hour, now);
-        assert_eq!(v.bad, 3);
+        assert_eq!(v.stretch, 5);
         assert_eq!(state(&v), State::Reset);
 
         let mut later = hour;
         for i in 1..=10 { later[((now + i) % 60) as usize] = minute(now + i, 60, [0, 0]) }
         let v = verdict(&later, now + 10);
-        assert!(v.bad == 3 && state(&v) == State::Recovering);
+        assert!(v.bad == 5 && state(&v) == State::Recovering);
 
         assert_eq!(state(&verdict(&hour, now + 12)), State::Reset);
 

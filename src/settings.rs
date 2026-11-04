@@ -23,7 +23,7 @@ const COUNT: usize = 15;
 
 const SETTINGS: [Setting; COUNT] = [
     Setting { key: "bad_lookups", name: "Bad minute", hint: "Lookups missed in a minute, both hosts", kind: Kind::Step(1, 60), default: 5 },
-    Setting { key: "reset_after", name: "Reset after", hint: "Bad minutes in the hour before it says RESET", kind: Kind::Step(1, 10), default: 3 },
+    Setting { key: "reset_stretch", name: "Reset after", hint: "Bad minutes within 15 before it says RESET", kind: Kind::Step(2, 15), default: 5 },
     Setting { key: "recovery", name: "Recovery after", hint: "Quiet minutes after the last bad one", kind: Kind::Choice(&[5, 10, 15, 20, 30]), default: 10 },
     Setting { key: "readings", name: "Readings", hint: "Loss, ping, router and bad minutes", kind: Kind::Toggle, default: 1 },
     Setting { key: "hour_strip", name: "Hour strip", hint: "The last 60 minutes, one cell each", kind: Kind::Toggle, default: 1 },
@@ -340,9 +340,9 @@ mod tests {
     #[test]
     fn saved_settings() {
         assert_eq!(parse("bad_minute 3\n")[BAD_LOST], 5);
-        let v = parse("bad_lookups 7\nsize 125\nflip 0\nreset_after 99\nsize2 3\nrecovery x\nlock\n");
+        let v = parse("bad_lookups 7\nsize 125\nflip 0\nreset_stretch 99\nsize2 3\nrecovery x\nlock\n");
         assert_eq!((v[BAD_LOST], v[SIZE], v[FLIP]), (7, 125, 0));
-        assert_eq!((v[RESET_AFTER], v[RECOVERY], v[LOCK]), (3, 10, 0));
+        assert_eq!((v[RESET_AFTER], v[RECOVERY], v[LOCK]), (5, 10, 0));
         assert_eq!(parse(&text(&v)), v);
         assert!(!text(&v).contains("Start"));
 
