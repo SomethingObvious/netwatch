@@ -2,13 +2,16 @@
 use std::ffi::c_void;
 use std::io::Write;
 use std::mem::{size_of, zeroed};
+use std::net::{Ipv4Addr, UdpSocket};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const BAD_MINUTE_LOST: u8 = 2;
-const RESET_BAD_MINUTES: usize = 3;
+mod settings;
+use settings::{get, on};
+
+const ROUTER_DROPPING: u32 = 2;
 const HOSTS: [[u8; 4]; 2] = [[1, 1, 1, 1], [8, 8, 8, 8]];
 const ROUTER: usize = 2;
 
@@ -25,9 +28,7 @@ struct Min {
 impl Min {
     fn lost(&self) -> u8 {
         if self.sent[0] == 0 || self.sent[1] == 0 { return 0 }
-        let line = self.lost[0].min(self.lost[1]);
-        let router = self.lost[ROUTER];
-        if router > 0 && router < self.sent[ROUTER] { line.saturating_sub(router) } else { line }
+        self.lost[0].min(self.lost[1])
     }
     fn sent(&self) -> u8 {
         self.sent[0].max(self.sent[1])
@@ -52,7 +53,7 @@ struct Verdict {
 }
 
 impl Verdict {
-    fn reset(&self) -> bool { self.bad >= RESET_BAD_MINUTES && self.recent_bad }
+    fn reset(&self) -> bool { self.bad >= get(settings::RESET_AFTER) as usize && self.recent_bad }
 }
 
 fn in_window(m: &Min, now: u64, span: u64) -> bool {
@@ -67,13 +68,13 @@ fn verdict(hour: &[Min; 60], now: u64) -> Verdict {
         v.measured += 1;
         let lost = m.lost();
         if lost > 0 { v.lossy += 1 }
-        if lost >= BAD_MINUTE_LOST {
+        if lost as u16 >= get(settings::BAD_LOST) {
             v.bad += 1;
             last_bad = last_bad.max(Some(m.stamp));
         }
     }
     if let Some(at) = last_bad {
-        v.recent_bad = measured().filter(|m| m.stamp > at).count() < 10;
+        v.recent_bad = measured().filter(|m| m.stamp > at).count() < get(settings::RECOVERY) as usize;
     }
     v
 }
@@ -103,7 +104,7 @@ fn live(hour: &[Min; 60], now: u64) -> Live {
         loss_pct: (sent > 0).then(|| 100.0 * lost as f32 / sent as f32),
         ping_ms: (replies > 0).then(|| rtt / replies),
         router_ms: (r_replies > 0).then(|| r_rtt / r_replies),
-        router_dropping: r_lost >= BAD_MINUTE_LOST as u32,
+        router_dropping: r_lost >= ROUTER_DROPPING,
     }
 }
 
@@ -112,7 +113,7 @@ enum State { Measuring, Clean, Fine, Watch, Recovering, Reset }
 
 fn state(v: &Verdict) -> State {
     if v.reset() { State::Reset }
-    else if v.bad >= RESET_BAD_MINUTES { State::Recovering }
+    else if v.bad >= get(settings::RESET_AFTER) as usize { State::Recovering }
     else if v.bad > 0 { State::Watch }
     else if v.lossy > 0 { State::Fine }
     else if v.measured > 0 { State::Clean }
@@ -190,6 +191,43 @@ const HOST_UNREACHABLE: u32 = 11003;
 const RESET_OFFLINE_ROUNDS: u32 = 30;
 const SYNC_GRACE: Duration = Duration::from_secs(180);
 
+fn dns_query(id: u16) -> [u8; 29] {
+    let mut q = [0u8; 29];
+    q[..2].copy_from_slice(&id.to_be_bytes());
+    q[2] = 1;
+    q[5] = 1;
+    q[12..].copy_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+    q
+}
+
+fn lookups(socket: &UdpSocket, id: u16) -> [Option<Option<u32>>; 2] {
+    let start = Instant::now();
+    let to = |i: usize| Ipv4Addr::from(HOSTS[i]);
+    let mut result = [None; 2];
+    for i in 0..2 {
+        if socket.send_to(&dns_query(id.wrapping_add(i as u16)), (to(i), 53)).is_ok() { result[i] = Some(None) }
+    }
+    let mut buf = [0u8; 512];
+    while result.contains(&Some(None)) {
+        let left = Duration::from_millis(900).saturating_sub(start.elapsed());
+        if left.is_zero() || socket.set_read_timeout(Some(left)).is_err() { break }
+        match socket.recv_from(&mut buf) {
+            Ok((n, from)) if n >= 2 => {
+                let reply = u16::from_be_bytes([buf[0], buf[1]]);
+                for i in 0..2 {
+                    if reply == id.wrapping_add(i as u16) && from.ip() == to(i) && result[i] == Some(None) {
+                        result[i] = Some(Some(start.elapsed().as_millis() as u32));
+                    }
+                }
+            }
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+            Err(_) => break,
+        }
+    }
+    result
+}
+
 fn pinger() {
     unsafe {
         let mut icmp = IcmpCreateFile();
@@ -197,6 +235,13 @@ fn pinger() {
             std::thread::sleep(Duration::from_secs(1));
             icmp = IcmpCreateFile();
         }
+        let socket = loop {
+            match UdpSocket::bind(("0.0.0.0", 0)) {
+                Ok(s) => break s,
+                Err(_) => std::thread::sleep(Duration::from_secs(1)),
+            }
+        };
+        let mut id = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as u16);
         let data = [0u8; 8];
         let mut reply = [0u64; 16];
         let mut offline_rounds = 0;
@@ -209,23 +254,26 @@ fn pinger() {
             }
             let start = Instant::now();
             let mut offline = true;
-            let targets = [Some(u32::from_ne_bytes(HOSTS[0])), Some(u32::from_ne_bytes(HOSTS[1])), router_address()];
-            for (i, target) in targets.iter().enumerate() {
-                let Some(addr) = *target else { continue };
-                let timeout = if i == ROUTER { 500 } else { 900 };
-                let n = IcmpSendEcho(icmp, addr, data.as_ptr().cast(), 8, null(),
-                    reply.as_mut_ptr().cast(), size_of::<[u64; 16]>() as u32, timeout);
-                let lost = if n > 0 {
-                    (reply[0] >> 32) as u32 != 0
-                } else {
-                    match GetLastError() { TIMED_OUT | HOST_UNREACHABLE => true, _ => continue }
-                };
+            id = id.wrapping_add(2);
+            for (i, answer) in lookups(&socket, id).into_iter().enumerate() {
+                let Some(ms) = answer else { continue };
                 offline = false;
-                if i != ROUTER {
-                    if !lost { syncing_until = None }
-                    if lost && syncing_until.is_some_and(|t| Instant::now() < t) { continue }
+                if ms.is_some() { syncing_until = None }
+                if ms.is_none() && syncing_until.is_some_and(|t| Instant::now() < t) { continue }
+                record(i, ms.is_none(), ms.unwrap_or(0));
+            }
+            if let Some(addr) = router_address() {
+                let n = IcmpSendEcho(icmp, addr, data.as_ptr().cast(), 8, null(),
+                    reply.as_mut_ptr().cast(), size_of::<[u64; 16]>() as u32, 500);
+                let lost = if n > 0 {
+                    Some((reply[0] >> 32) as u32 != 0)
+                } else {
+                    matches!(GetLastError(), TIMED_OUT | HOST_UNREACHABLE).then_some(true)
+                };
+                if let Some(lost) = lost {
+                    offline = false;
+                    record(ROUTER, lost, if lost { 0 } else { reply[1] as u32 });
                 }
-                record(i, lost, if lost { 0 } else { reply[1] as u32 });
             }
             offline_rounds = if offline { offline_rounds + 1 } else { 0 };
             if offline_rounds == RESET_OFFLINE_ROUNDS {
@@ -246,7 +294,6 @@ const BAD: (usize, usize) = (19, 2);
 const CELLS: usize = 21;
 const FIELDS: [(usize, usize); 5] = [HEADLINE, LOSS, PING, ROUTER_CELLS, BAD];
 const DRUM: &str = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.%-/";
-const NUMBER_REFRESH: Duration = Duration::from_secs(10);
 
 fn word(s: State) -> &'static str {
     match s {
@@ -308,7 +355,8 @@ static BOARD: Mutex<Board> = Mutex::new(BLANK_BOARD);
 
 impl Board {
     fn set(&mut self, t: [char; CELLS], colours: [u32; 5], at: Instant) -> bool {
-        let numbers_due = self.numbers_at.map_or(true, |n| at - n >= NUMBER_REFRESH);
+        let refresh = Duration::from_secs(get(settings::REFRESH) as u64);
+        let numbers_due = self.numbers_at.map_or(true, |n| at - n >= refresh);
         if numbers_due { self.numbers_at = Some(at) }
         for (k, (start, len)) in FIELDS.into_iter().enumerate() {
             if start != HEADLINE.0 && !numbers_due { continue }
@@ -321,6 +369,12 @@ impl Board {
             }
         }
         self.busy()
+    }
+
+    fn snap(&mut self) {
+        self.shown = self.target;
+        self.old = self.target;
+        self.half = [false; CELLS];
     }
 
     fn busy(&self) -> bool {
@@ -357,7 +411,9 @@ const RED: u32 = rgb(232, 38, 58);
 const LAMP_OFF: u32 = rgb(46, 47, 50);
 
 const BW: i32 = 284;
-const BH: i32 = 134;
+const VERDICT_ROW: i32 = 60;
+const READINGS_ROW: i32 = 43;
+const STRIP_ROW: i32 = 31;
 const BIG: (i32, i32, i32) = (22, 38, 24);
 const SMALL: (i32, i32, i32) = (14, 22, 16);
 
@@ -383,8 +439,13 @@ impl Painter {
         DeleteObject(brush);
     }
 
+    unsafe fn text(&self, s: &str, (x, y, w, h): (i32, i32, i32, i32), size: f32, colour: u32, align: u32, face: &str, tracking: i32) {
+        let r = Rect { l: self.px(x), t: self.px(y), r: self.px(x + w), b: self.px(y + h) };
+        self.text_px(s, r, face, (size * self.s).round() as i32, colour, align, self.px(tracking));
+    }
+
     unsafe fn text_px(&self, s: &str, r: Rect, face: &str, size: i32, colour: u32, align: u32, tracking: i32) {
-        let font = CreateFontW(-size, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, wide(face).as_ptr());
+        let font = CreateFontW(-size, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 5, 0, wide(face).as_ptr());
         let old = SelectObject(self.dc, font);
         SetTextColor(self.dc, colour);
         SetTextCharacterExtra(self.dc, tracking);
@@ -446,9 +507,7 @@ fn colours(s: State, l: &Live, bad: usize) -> [u32; 5] {
     FIELDS.map(|f| field_colour(f, s, l, bad))
 }
 
-unsafe fn draw_board(p: &Painter, hour: &[Min; 60], now: u64, board: &Board, w: i32, h: i32) {
-    let s = state(&verdict(hour, now));
-
+unsafe fn frame(p: &Painter, w: i32, h: i32) {
     let band = 6;
     for y in (0..h).step_by(band) {
         let mix = |a: u8, b: u8| (a as i32 + (b as i32 - a as i32) * y / h.max(1)) as u8;
@@ -459,6 +518,11 @@ unsafe fn draw_board(p: &Painter, hour: &[Min; 60], now: u64, board: &Board, w: 
     p.fill(0, h - line, w, h, rgb(18, 19, 21));
     p.fill(p.px(4), p.px(4), w - p.px(4), h - p.px(4), FRAME);
     p.fill(p.px(5), p.px(5), w - p.px(5), h - p.px(5), GROUND);
+}
+
+unsafe fn draw_board(p: &Painter, hour: &[Min; 60], now: u64, board: &Board, w: i32, h: i32) {
+    let s = state(&verdict(hour, now));
+    frame(p, w, h);
 
     let lamp = match s { State::Reset => RED, State::Watch | State::Recovering => AMBER, _ => LAMP_OFF };
     p.dot(258, 30, 5.5, FRAME);
@@ -473,17 +537,21 @@ unsafe fn draw_board(p: &Painter, hour: &[Min; 60], now: u64, board: &Board, w: 
     };
     cells(HEADLINE, 13, 11, BIG);
 
-    let row = 60;
-    p.label("LOSS 5 MIN", 13, row, 70, LEFT);
-    p.label("PING MS", 90, row, 60, LEFT);
-    p.label("ROUTER MS", 150, row, 60, LEFT);
-    p.label("BAD / HR", 214, row, 60, LEFT);
-    cells(LOSS, 13, row + 11, SMALL);
-    cells(PING, 90, row + 11, SMALL);
-    cells(ROUTER_CELLS, 150, row + 11, SMALL);
-    cells(BAD, 214, row + 11, SMALL);
+    let mut y = VERDICT_ROW;
+    if on(settings::READINGS) {
+        p.label("LOSS 5 MIN", 13, y, 70, LEFT);
+        p.label("PING MS", 90, y, 60, LEFT);
+        p.label("ROUTER MS", 150, y, 60, LEFT);
+        p.label("BAD / HR", 214, y, 60, LEFT);
+        cells(LOSS, 13, y + 11, SMALL);
+        cells(PING, 90, y + 11, SMALL);
+        cells(ROUTER_CELLS, 150, y + 11, SMALL);
+        cells(BAD, 214, y + 11, SMALL);
+        y += READINGS_ROW;
+    }
+    if !on(settings::STRIP) { return }
 
-    let strip = 103;
+    let strip = y;
     p.label("LAST HOUR", 13, strip, 80, LEFT);
     p.label("NOW", 210, strip, 60, RIGHT);
     let (x0, y0, width, height) = (p.px(13), p.px(strip + 12), p.px(BW - 26), p.px(10));
@@ -493,7 +561,7 @@ unsafe fn draw_board(p: &Painter, hour: &[Min; 60], now: u64, board: &Board, w: 
         let minute = hour[(m % 60) as usize];
         let colour = if minute.stamp != m || minute.sent() == 0 { rgb(17, 17, 19) }
             else if minute.lost() == 0 { rgb(48, 50, 54) }
-            else if minute.lost() < BAD_MINUTE_LOST { LABEL }
+            else if (minute.lost() as u16) < get(settings::BAD_LOST) { LABEL }
             else if s == State::Reset { RED } else { AMBER };
         let x = x0 + i as i32 * width / 60;
         let x1 = x0 + (i as i32 + 1) * width / 60 - gap;
@@ -501,7 +569,7 @@ unsafe fn draw_board(p: &Painter, hour: &[Min; 60], now: u64, board: &Board, w: 
     }
 }
 
-unsafe fn paint(hwnd: H) {
+unsafe fn paint(hwnd: H, s: f32, draw: impl Fn(&Painter, i32, i32)) {
     let mut ps: PaintStruct = zeroed();
     let screen = BeginPaint(hwnd, &mut ps);
     let mut client: Rect = zeroed();
@@ -510,9 +578,7 @@ unsafe fn paint(hwnd: H) {
     let bmp = CreateCompatibleBitmap(screen, client.r, client.b);
     let old_bmp = SelectObject(dc, bmp);
     SetBkMode(dc, 1);
-    let hour = *HOUR.lock().unwrap();
-    let p = Painter { dc, s: GetDpiForWindow(hwnd) as f32 / 96.0 };
-    draw_board(&p, &hour, now_min(), &BOARD.lock().unwrap(), client.r, client.b);
+    draw(&Painter { dc, s }, client.r, client.b);
     BitBlt(screen, 0, 0, client.r, client.b, dc, 0, 0, 0x00CC_0020);
     SelectObject(dc, old_bmp);
     DeleteObject(bmp);
@@ -525,8 +591,9 @@ unsafe fn refresh(hwnd: H) {
     let now = now_min();
     let v = verdict(&hour, now);
     let (s, l) = (state(&v), live(&hour, now));
-    if BOARD.lock().unwrap().set(targets(s, &l, v.bad), colours(s, &l, v.bad), Instant::now()) {
-        SetTimer(hwnd, 1, 30, null());
+    let mut board = BOARD.lock().unwrap();
+    if board.set(targets(s, &l, v.bad), colours(s, &l, v.bad), Instant::now()) {
+        if on(settings::FLIP) { SetTimer(hwnd, 1, 30, null()); } else { board.snap() }
     }
     InvalidateRect(hwnd, null(), 0);
 }
@@ -553,7 +620,7 @@ fn sample_hour(state: &str, now: u64) -> [Min; 60] {
 
 unsafe fn render(state_name: &str, out: &str, flipping: bool) {
     let dpi = 168;
-    let (w, h) = size_for(dpi);
+    let (w, h) = if state_name == "settings" { settings::size(dpi) } else { size_for(dpi) };
     let dc = CreateCompatibleDC(GetDC(null_mut()));
     let mut info = [0u32; 10];
     info[0] = 40;
@@ -575,16 +642,35 @@ unsafe fn render(state_name: &str, out: &str, flipping: bool) {
         board.set(targets(State::Watch, &l, v.bad), colours(s, &l, v.bad), Instant::now());
         for _ in 0..3 { board.tick(); }
     }
-    let p = Painter { dc, s: dpi as f32 / 96.0 };
-    draw_board(&p, &hour, now, &board, w, h);
+    if state_name == "settings" {
+        settings::draw(&Painter { dc, s: dpi as f32 / 96.0 }, w, h);
+    } else {
+        draw_board(&Painter { dc, s: scale(dpi) }, &hour, now, &board, w, h);
+    }
     GdiFlush();
     let _ = std::fs::write(out, std::slice::from_raw_parts(bits, (w * h * 4) as usize));
     let _ = std::fs::write(format!("{out}.size"), format!("{w}x{h}"));
 }
 
+fn scale(dpi: u32) -> f32 {
+    dpi as f32 / 96.0 * get(settings::SIZE) as f32 / 100.0
+}
+
 fn size_for(dpi: u32) -> (i32, i32) {
-    let s = dpi as f32 / 96.0;
-    ((BW as f32 * s).round() as i32, (BH as f32 * s).round() as i32)
+    let s = scale(dpi);
+    let mut h = VERDICT_ROW;
+    if on(settings::READINGS) { h += READINGS_ROW }
+    if on(settings::STRIP) { h += STRIP_ROW }
+    ((BW as f32 * s).round() as i32, (h as f32 * s).round() as i32)
+}
+
+unsafe fn resize(hwnd: H) {
+    let (w, h) = size_for(GetDpiForWindow(hwnd));
+    let mut r: Rect = zeroed();
+    GetWindowRect(hwnd, &mut r);
+    SetWindowPos(hwnd, null_mut(), r.r - w, r.b - h, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    let _ = std::fs::write(pos_file(), format!("{} {}", r.r - w, r.b - h));
+    InvalidateRect(hwnd, null(), 0);
 }
 
 fn pos_file() -> std::path::PathBuf {
@@ -638,24 +724,40 @@ unsafe fn place(hwnd: H) {
 unsafe extern "system" fn wndproc(hwnd: H, msg: u32, wp: usize, lp: isize) -> isize {
     match msg {
         WM_ERASEBKGND => 1,
-        WM_PAINT => { paint(hwnd); 0 }
+        WM_PAINT => {
+            let hour = *HOUR.lock().unwrap();
+            let board = BOARD.lock().unwrap();
+            paint(hwnd, scale(GetDpiForWindow(hwnd)), |p, w, h| draw_board(p, &hour, now_min(), &board, w, h));
+            0
+        }
         WM_APP => { refresh(hwnd); 0 }
+        WM_OPEN_SETTINGS => { settings::open(hwnd); 0 }
         WM_TIMER => {
             if !BOARD.lock().unwrap().tick() { KillTimer(hwnd, 1); }
             InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_LBUTTONDOWN => {
-            ReleaseCapture();
-            SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
-            let mut r: Rect = zeroed();
-            GetWindowRect(hwnd, &mut r);
-            let _ = std::fs::write(pos_file(), format!("{} {}", r.l, r.t));
+            let mut before: Rect = zeroed();
+            GetWindowRect(hwnd, &mut before);
+            if !on(settings::LOCK) {
+                ReleaseCapture();
+                SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+            }
+            let mut after: Rect = zeroed();
+            GetWindowRect(hwnd, &mut after);
+            if (before.l, before.t) == (after.l, after.t) {
+                settings::toggle(hwnd);
+            } else {
+                settings::close();
+                let _ = std::fs::write(pos_file(), format!("{} {}", after.l, after.t));
+            }
             0
         }
         WM_RBUTTONUP => {
             let menu = CreatePopupMenu();
             let starts = starts_with_windows();
+            AppendMenuW(menu, 0, 3, wide("Settings").as_ptr());
             AppendMenuW(menu, if starts { MF_CHECKED } else { 0 }, 2, wide("Start With Windows").as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
             AppendMenuW(menu, 0, 1, wide("Close").as_ptr());
@@ -665,6 +767,7 @@ unsafe extern "system" fn wndproc(hwnd: H, msg: u32, wp: usize, lp: isize) -> is
             match TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, hwnd, null()) {
                 1 => { PostMessageW(hwnd, WM_CLOSE, 0, 0); }
                 2 => set_starts_with_windows(!starts),
+                3 => settings::toggle(hwnd),
                 _ => {}
             }
             DestroyMenu(menu);
@@ -706,14 +809,27 @@ fn main() {
             return;
         }
         CreateMutexW(null(), 0, wide("netwatch-widget").as_ptr());
-        if GetLastError() == 183 { return }
+        if GetLastError() == 183 {
+            let running = FindWindowW(wide("NetwatchWidget").as_ptr(), null());
+            if !running.is_null() {
+                AllowSetForegroundWindow(u32::MAX);
+                PostMessageW(running, WM_OPEN_SETTINGS, 0, 0);
+            }
+            return;
+        }
         let saved = std::fs::read_to_string(data_dir().join("hour.txt")).unwrap_or_default();
         *HOUR.lock().unwrap() = parse_hour(&saved);
+        settings::load();
         TASKBAR_CREATED.store(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) as isize, Relaxed);
         let inst = GetModuleHandleW(null());
         let class = wide("NetwatchWidget");
-        RegisterClassW(&WndClass { style: 0, wndproc, cls_extra: 0, wnd_extra: 0, inst, icon: null_mut(),
-            cursor: LoadCursorW(null_mut(), 32512), background: null_mut(), menu: null(), class: class.as_ptr() });
+        let page_class = wide("NetwatchSettings");
+        let icon = LoadIconW(inst, 1 as *const u16);
+        let arrow = LoadCursorW(null_mut(), 32512);
+        RegisterClassW(&WndClass { style: 0, wndproc, cls_extra: 0, wnd_extra: 0, inst, icon,
+            cursor: arrow, background: null_mut(), menu: null(), class: class.as_ptr() });
+        RegisterClassW(&WndClass { style: 0, wndproc: settings::proc, cls_extra: 0, wnd_extra: 0, inst, icon,
+            cursor: arrow, background: null_mut(), menu: null(), class: page_class.as_ptr() });
         std::thread::spawn(pinger);
 
         while !CLOSED.load(Relaxed) {
@@ -750,7 +866,15 @@ unsafe fn desktop_window() -> H {
 }
 
 const WM_DESTROY: u32 = 0x0002;
+const WM_ACTIVATE: u32 = 0x0006;
 const WM_ENDSESSION: u32 = 0x0016;
+const WM_SETCURSOR: u32 = 0x0020;
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const VK_ESCAPE: usize = 0x1B;
+const IDC_HAND: usize = 32649;
+const TME_LEAVE: u32 = 0x2;
 const MF_CHECKED: u32 = 0x8;
 const MF_SEPARATOR: u32 = 0x800;
 const GW_OWNER: u32 = 4;
@@ -768,6 +892,7 @@ const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_RBUTTONUP: u32 = 0x0205;
 const WM_DPICHANGED: u32 = 0x02E0;
 const WM_APP: u32 = 0x8000;
+const WM_OPEN_SETTINGS: u32 = WM_APP + 1;
 const HTCAPTION: usize = 2;
 const WS_POPUP: u32 = 0x8000_0000;
 const WS_EX_TOOLWINDOW: u32 = 0x80;
@@ -785,6 +910,8 @@ const DT_NOPREFIX: u32 = 0x800;
 const DT_NOCLIP: u32 = 0x100;
 
 #[repr(C)] struct Point { x: i32, y: i32 }
+#[repr(C)] struct TrackMouse { size: u32, flags: u32, hwnd: H, hover: u32 }
+#[repr(C)] struct MonitorInfo { size: u32, monitor: Rect, work: Rect, flags: u32 }
 #[repr(C)] #[derive(Clone, Copy)] struct Rect { l: i32, t: i32, r: i32, b: i32 }
 #[repr(C)] struct Msg { hwnd: H, message: u32, wp: usize, lp: isize, time: u32, pt: Point, private: u32 }
 #[repr(C)] struct PaintStruct { dc: H, erase: i32, rc: Rect, restore: i32, inc: i32, reserved: [u8; 32] }
@@ -831,6 +958,13 @@ extern "system" {
     fn TrackPopupMenu(m: H, flags: u32, x: i32, y: i32, r: i32, h: H, rc: *const Rect) -> i32;
     fn DestroyMenu(m: H) -> i32;
     fn GetWindow(h: H, cmd: u32) -> H;
+    fn LoadIconW(inst: H, name: *const u16) -> H;
+    fn AllowSetForegroundWindow(pid: u32) -> i32;
+    fn SetCursor(cursor: H) -> H;
+    fn ScreenToClient(h: H, p: *mut Point) -> i32;
+    fn TrackMouseEvent(t: *mut TrackMouse) -> i32;
+    fn MonitorFromWindow(h: H, flags: u32) -> H;
+    fn GetMonitorInfoW(m: H, info: *mut MonitorInfo) -> i32;
     fn RegisterWindowMessageW(name: *const u16) -> u32;
 }
 #[link(name = "advapi32")]
@@ -914,10 +1048,8 @@ mod tests {
         let one = Min { stamp: now, sent: [1, 0, 0], lost: [1, 0, 0], rtt: [0; 3] };
         assert_eq!(one.lost(), 0);
 
-        let weak = Min { stamp: now, sent: [60; 3], lost: [6, 6, 5], rtt: [0; 3] };
-        assert_eq!(weak.lost(), 1);
-        let hung = Min { stamp: now, sent: [60; 3], lost: [60, 60, 60], rtt: [0; 3] };
-        assert_eq!(hung.lost(), 60);
+        let router = Min { stamp: now, sent: [60; 3], lost: [6, 7, 30], rtt: [0; 3] };
+        assert_eq!(router.lost(), 6);
     }
 
     #[test]
@@ -958,7 +1090,7 @@ mod tests {
         b.set(next, colours(State::Watch, &fine, 20), start + Duration::from_secs(3));
         assert_eq!((b.target[0], b.colour[0]), ('W', AMBER));
         assert_eq!((b.target[PING.0 + 2], b.colour[1]), ('9', RED));
-        b.set(next, colours(State::Watch, &fine, 20), start + NUMBER_REFRESH);
+        b.set(next, colours(State::Watch, &fine, 20), start + Duration::from_secs(10));
         assert_eq!((b.target[PING.0 + 2], b.colour[1]), ('0', LETTER));
     }
 
