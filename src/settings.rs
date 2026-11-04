@@ -12,9 +12,14 @@ pub const STRIP: usize = 4;
 pub const SIZE: usize = 5;
 pub const REFRESH: usize = 6;
 pub const FLIP: usize = 7;
-pub const LOCK: usize = 8;
-pub const STARTUP: usize = 9;
-const COUNT: usize = 10;
+pub const DOWN_UP: usize = 8;
+pub const CPU: usize = 9;
+pub const RAM: usize = 10;
+pub const GPU: usize = 11;
+pub const BATTERY: usize = 12;
+pub const LOCK: usize = 13;
+pub const STARTUP: usize = 14;
+const COUNT: usize = 15;
 
 const SETTINGS: [Setting; COUNT] = [
     Setting { key: "bad_minute", name: "Bad minute", hint: "Missed replies in a minute that make it bad", kind: Kind::Step(1, 30), default: 3 },
@@ -25,11 +30,16 @@ const SETTINGS: [Setting; COUNT] = [
     Setting { key: "size", name: "Size", hint: "Percent of the normal board", kind: Kind::Choice(&[100, 125, 150, 200]), default: 100 },
     Setting { key: "number_updates", name: "Number updates", hint: "Seconds between refreshes of the numbers", kind: Kind::Choice(&[5, 10, 30, 60]), default: 10 },
     Setting { key: "flip", name: "Flip animation", hint: "Off changes values in place", kind: Kind::Toggle, default: 1 },
+    Setting { key: "down_up", name: "Down and up", hint: "Mbps on the adapter the checks go out on", kind: Kind::Toggle, default: 0 },
+    Setting { key: "cpu", name: "CPU", hint: "Percent busy across all cores", kind: Kind::Toggle, default: 0 },
+    Setting { key: "ram", name: "RAM", hint: "Percent of memory in use", kind: Kind::Toggle, default: 0 },
+    Setting { key: "gpu", name: "GPU", hint: "Busiest engine, as Task Manager shows it", kind: Kind::Toggle, default: 0 },
+    Setting { key: "battery", name: "Battery", hint: "Charge left, amber under 20%", kind: Kind::Toggle, default: 0 },
     Setting { key: "lock", name: "Lock position", hint: "Stops dragging. A click still opens this", kind: Kind::Toggle, default: 0 },
     Setting { key: "", name: "Start with Windows", hint: "Runs it when you sign in", kind: Kind::Toggle, default: 0 },
 ];
 
-const SECTIONS: [(usize, &str); 3] = [(BAD_LOST, "WHAT COUNTS"), (READINGS, "WHAT'S SHOWN"), (LOCK, "DESKTOP")];
+const SECTIONS: [(usize, &str); 4] = [(BAD_LOST, "WHAT COUNTS"), (READINGS, "WHAT'S SHOWN"), (DOWN_UP, "THIS PC"), (LOCK, "DESKTOP")];
 
 const fn defaults() -> [u16; COUNT] {
     let mut v = [0; COUNT];
@@ -45,6 +55,7 @@ static VALUES: Mutex<[u16; COUNT]> = Mutex::new(defaults());
 
 pub fn get(i: usize) -> u16 { VALUES.lock().unwrap()[i] }
 pub fn on(i: usize) -> bool { get(i) != 0 }
+pub fn set(i: usize, v: u16) { VALUES.lock().unwrap()[i] = v }
 
 fn valid(i: usize, v: u16) -> bool {
     match SETTINGS[i].kind {
@@ -96,8 +107,8 @@ static HOVER: AtomicIsize = AtomicIsize::new(-1);
 
 const PW: i32 = 300;
 const TOP: i32 = 40;
-const HEAD: i32 = 20;
-const ROW: i32 = 36;
+const HEAD: i32 = 24;
+const ROW: i32 = 32;
 const FOOT: i32 = TOP + HEAD * SECTIONS.len() as i32 + ROW * COUNT as i32 + 8;
 const PH: i32 = FOOT + 26 + 14;
 const VALUE_X: i32 = 218;
@@ -116,10 +127,10 @@ fn items() -> Vec<(Hit, [i32; 4])> {
     for (i, s) in SETTINGS.iter().enumerate() {
         let y = row_top(i);
         match s.kind {
-            Kind::Toggle => v.push((Hit::Flip(i), [VALUE_X - 20, y + 4, 88, 26])),
+            Kind::Toggle => v.push((Hit::Flip(i), [VALUE_X - 20, y + 2, 88, 26])),
             _ => {
-                v.push((Hit::Less(i), [VALUE_X - 20, y + 8, 18, 18]));
-                v.push((Hit::More(i), [VALUE_X + 50, y + 8, 18, 18]));
+                v.push((Hit::Less(i), [VALUE_X - 20, y + 6, 18, 18]));
+                v.push((Hit::More(i), [VALUE_X + 50, y + 6, 18, 18]));
             }
         }
     }
@@ -209,7 +220,7 @@ unsafe fn act(page: H, hit: Hit) {
                 v[i] = stepped(i, v[i], !matches!(hit, Hit::Less(_)));
             }
             save();
-            if [SIZE, READINGS, STRIP].contains(&i) {
+            if [SIZE, READINGS, STRIP, DOWN_UP, CPU, RAM, GPU, BATTERY].contains(&i) {
                 resize(widget);
                 place_page(page, widget);
             }
@@ -287,25 +298,25 @@ pub unsafe fn draw(p: &Painter, w: i32, h: i32) {
 
     for (row, head) in SECTIONS {
         let y = row_top(row) - HEAD;
-        p.label(head, 16, y + 5, 200, LEFT);
-        p.fill(p.px(16), p.px(y + 17), p.px(PW - 14), p.px(y + 17) + p.px(1).max(1), HINGE);
+        p.label(head, 16, y + 9, 200, LEFT);
+        p.fill(p.px(16), p.px(y + 21), p.px(PW - 14), p.px(y + 21) + p.px(1).max(1), HINGE);
     }
 
     for (i, s) in SETTINGS.iter().enumerate() {
         let y = row_top(i);
-        p.text(s.name, (16, y + 5, 176, 15), 12.5, LETTER, LEFT, NAME_FACE, 0);
-        p.text(s.hint, (16, y + 20, 182, 12), 9.5, LABEL, LEFT, HINT_FACE, 0);
+        p.text(s.name, (16, y + 3, 176, 15), 12.5, LETTER, LEFT, NAME_FACE, 0);
+        p.text(s.hint, (16, y + 18, 182, 12), 9.5, LABEL, LEFT, HINT_FACE, 0);
         let v = get(i);
         let toggle = matches!(s.kind, Kind::Toggle);
         let value: Vec<char> = if toggle { if v != 0 { "ON" } else { "OFF" }.chars().collect() } else { v.to_string().chars().collect() };
         if toggle && lit(Hit::Flip(i)) {
-            p.fill(p.px(VALUE_X - 2), p.px(y + 4), p.px(VALUE_X + 48), p.px(y + 30), HINGE);
+            p.fill(p.px(VALUE_X - 2), p.px(y + 2), p.px(VALUE_X + 48), p.px(y + 28), HINGE);
         }
         let colour = if toggle && v == 0 { LABEL } else { LETTER };
         let pad = 3usize.saturating_sub(value.len());
         for k in 0..3 {
             let c = if k >= pad { value[k - pad] } else { ' ' };
-            p.flap(VALUE_X + k as i32 * SMALL.2, y + 6, SMALL, c, c, false, colour);
+            p.flap(VALUE_X + k as i32 * SMALL.2, y + 4, SMALL, c, c, false, colour);
         }
         if !toggle {
             for hit in [Hit::Less(i), Hit::More(i)] {

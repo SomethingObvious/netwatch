@@ -286,13 +286,141 @@ fn pinger() {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Sys { down: Option<f32>, up: Option<f32>, cpu: Option<f32>, ram: Option<f32>, gpu: Option<f32>, battery: Option<(u8, bool)> }
+
+static SYS: Mutex<Sys> = Mutex::new(Sys { down: None, up: None, cpu: None, ram: None, gpu: None, battery: None });
+
+fn ease(old: Option<f32>, new: Option<f32>) -> Option<f32> {
+    match (old, new) {
+        (Some(o), Some(n)) => Some(o + (n - o) * 0.3),
+        _ => new,
+    }
+}
+
+struct Gpu { query: H, counter: H, buf: Vec<u64> }
+
+impl Gpu {
+    unsafe fn open() -> Option<Gpu> {
+        let (mut query, mut counter) = (null_mut(), null_mut());
+        if PdhOpenQueryW(null(), 0, &mut query) != 0 { return None }
+        if PdhAddEnglishCounterW(query, wide(r"\GPU Engine(*)\Utilization Percentage").as_ptr(), 0, &mut counter) != 0 {
+            PdhCloseQuery(query);
+            return None;
+        }
+        PdhCollectQueryData(query);
+        Some(Gpu { query, counter, buf: Vec::new() })
+    }
+
+    unsafe fn read(&mut self) -> Option<f32> {
+        PdhCollectQueryData(self.query);
+        let (mut size, mut count) = (0u32, 0u32);
+        PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut size, &mut count, null_mut());
+        self.buf.resize((size as usize).div_ceil(8), 0);
+        if PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut size, &mut count, self.buf.as_mut_ptr().cast()) != 0 {
+            return None;
+        }
+        let mut engines: Vec<(String, f64)> = Vec::new();
+        for k in 0..count as usize {
+            let item = self.buf.as_ptr().add(k * 3);
+            let (name, status, value) = (*item as *const u16, *(item.add(1) as *const u32), f64::from_bits(*item.add(2)));
+            if status != 0 || name.is_null() { continue }
+            let len = (0..).take_while(|&i| *name.add(i) != 0).count();
+            let name = String::from_utf16_lossy(std::slice::from_raw_parts(name, len));
+            let engine = name.find("_luid").map_or(name.as_str(), |i| &name[i..]).to_string();
+            match engines.iter_mut().find(|e| e.0 == engine) {
+                Some(e) => e.1 += value,
+                None => engines.push((engine, value)),
+            }
+        }
+        Some(engines.iter().map(|e| e.1).fold(0.0, f64::max).min(100.0) as f32)
+    }
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) { unsafe { PdhCloseQuery(self.query); } }
+}
+
+fn sampler() {
+    let mut net: Option<(u32, u32, u32, Instant)> = None;
+    let mut cpu: Option<(u64, u64)> = None;
+    let mut gpu: Option<Gpu> = None;
+    loop {
+        let last = *SYS.lock().unwrap();
+        let mut next = Sys { down: None, up: None, cpu: None, ram: None, gpu: None, battery: None };
+        unsafe {
+            if on(settings::DOWN_UP) {
+                let mut index = 0u32;
+                let mut row = [0u32; 215];
+                if GetBestInterface(u32::from_ne_bytes(HOSTS[0]), &mut index) == 0 {
+                    row[128] = index;
+                    if GetIfEntry(row.as_mut_ptr().cast()) == 0 {
+                        let now = Instant::now();
+                        if let Some((_, i, o, then)) = net.filter(|n| n.0 == index) {
+                            let mbps = |bytes: u32| bytes as f32 * 8.0 / 1e6 / (now - then).as_secs_f32().max(0.1);
+                            next.down = ease(last.down, Some(mbps(row[138].wrapping_sub(i))));
+                            next.up = ease(last.up, Some(mbps(row[144].wrapping_sub(o))));
+                        }
+                        net = Some((index, row[138], row[144], now));
+                    }
+                }
+            } else {
+                net = None;
+            }
+
+            if on(settings::CPU) {
+                let (mut idle, mut kernel, mut user) = (0u64, 0u64, 0u64);
+                if GetSystemTimes(&mut idle, &mut kernel, &mut user) != 0 {
+                    if let Some((i, total)) = cpu {
+                        let all = (kernel + user).saturating_sub(total);
+                        if all > 0 {
+                            next.cpu = ease(last.cpu, Some(100.0 * (1.0 - idle.saturating_sub(i) as f32 / all as f32)));
+                        }
+                    }
+                    cpu = Some((idle, kernel + user));
+                }
+            } else {
+                cpu = None;
+            }
+
+            if on(settings::RAM) {
+                let mut status = [0u32; 16];
+                status[0] = 64;
+                if GlobalMemoryStatusEx(status.as_mut_ptr().cast()) != 0 { next.ram = Some(status[1] as f32) }
+            }
+
+            if on(settings::GPU) {
+                if gpu.is_none() { gpu = Gpu::open() }
+                next.gpu = ease(last.gpu, gpu.as_mut().and_then(|g| g.read()));
+            } else {
+                gpu = None;
+            }
+
+            if on(settings::BATTERY) {
+                let mut power = [0u8; 12];
+                if GetSystemPowerStatus(power.as_mut_ptr().cast()) != 0 && power[1] & 128 == 0 && power[2] <= 100 {
+                    next.battery = Some((power[2], power[0] == 1));
+                }
+            }
+        }
+        *SYS.lock().unwrap() = next;
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 const HEADLINE: (usize, usize) = (0, 9);
 const LOSS: (usize, usize) = (9, 4);
 const PING: (usize, usize) = (13, 3);
 const ROUTER_CELLS: (usize, usize) = (16, 3);
 const BAD: (usize, usize) = (19, 2);
-const CELLS: usize = 21;
-const FIELDS: [(usize, usize); 5] = [HEADLINE, LOSS, PING, ROUTER_CELLS, BAD];
+const DOWN: (usize, usize) = (21, 4);
+const UP: (usize, usize) = (25, 4);
+const CPU: (usize, usize) = (29, 3);
+const RAM: (usize, usize) = (32, 3);
+const GPU: (usize, usize) = (35, 3);
+const BATTERY: (usize, usize) = (38, 3);
+const CELLS: usize = 41;
+const FIELDS: [(usize, usize); 11] = [HEADLINE, LOSS, PING, ROUTER_CELLS, BAD, DOWN, UP, CPU, RAM, GPU, BATTERY];
 const DRUM: &str = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.%-/";
 
 fn word(s: State) -> &'static str {
@@ -307,7 +435,21 @@ fn shown_loss(x: f32) -> f32 {
     if tenths >= 10.0 { x.round() } else { tenths }
 }
 
-fn targets(s: State, l: &Live, bad: usize) -> [char; CELLS] {
+fn rate(v: Option<f32>) -> String {
+    match v {
+        None => "--".into(),
+        Some(x) if x < 9.95 => format!("{x:.1}"),
+        Some(x) if x < 999.5 => format!("{x:.0}"),
+        Some(x) if x < 9950.0 => format!("{:.1}G", x / 1000.0),
+        Some(x) => format!("{:.0}G", x / 1000.0),
+    }
+}
+
+fn percent(v: Option<f32>) -> String {
+    v.map_or("--".into(), |x| (x.round().clamp(0.0, 100.0) as u32).to_string())
+}
+
+fn targets(s: State, l: &Live, bad: usize, sys: &Sys) -> [char; CELLS] {
     let loss = match l.loss_pct.map(shown_loss) {
         None => "--".into(),
         Some(x) if x >= 10.0 => format!("{x}%"),
@@ -326,6 +468,12 @@ fn targets(s: State, l: &Live, bad: usize) -> [char; CELLS] {
     put(PING, &ms(l.ping_ms), true);
     put(ROUTER_CELLS, &router, true);
     put(BAD, &bad.min(99).to_string(), true);
+    put(DOWN, &rate(sys.down), true);
+    put(UP, &rate(sys.up), true);
+    put(CPU, &percent(sys.cpu), true);
+    put(RAM, &percent(sys.ram), true);
+    put(GPU, &percent(sys.gpu), true);
+    put(BATTERY, &percent(sys.battery.map(|b| b.0 as f32)), true);
     t
 }
 
@@ -343,18 +491,18 @@ struct Board {
     half: [bool; CELLS],
     wait: [u8; CELLS],
     target: [char; CELLS],
-    colour: [u32; 5],
+    colour: [u32; 11],
     numbers_at: Option<Instant>,
 }
 
 const BLANK_BOARD: Board = Board {
     shown: [' '; CELLS], old: [' '; CELLS], half: [false; CELLS], wait: [0; CELLS], target: [' '; CELLS],
-    colour: [LETTER; 5], numbers_at: None,
+    colour: [LETTER; 11], numbers_at: None,
 };
 static BOARD: Mutex<Board> = Mutex::new(BLANK_BOARD);
 
 impl Board {
-    fn set(&mut self, t: [char; CELLS], colours: [u32; 5], at: Instant) -> bool {
+    fn set(&mut self, t: [char; CELLS], colours: [u32; 11], at: Instant) -> bool {
         let refresh = Duration::from_secs(get(settings::REFRESH) as u64);
         let numbers_due = self.numbers_at.map_or(true, |n| at - n >= refresh);
         if numbers_due { self.numbers_at = Some(at) }
@@ -415,6 +563,7 @@ const VERDICT_ROW: i32 = 60;
 const READINGS_ROW: i32 = 43;
 const STRIP_ROW: i32 = 31;
 const BIG: (i32, i32, i32) = (22, 38, 24);
+const COLUMNS: [i32; 4] = [13, 81, 149, 217];
 const SMALL: (i32, i32, i32) = (14, 22, 16);
 
 struct Painter { dc: H, s: f32 }
@@ -489,7 +638,7 @@ impl Painter {
     }
 }
 
-fn field_colour(field: (usize, usize), s: State, l: &Live, bad: usize) -> u32 {
+fn field_colour(field: (usize, usize), s: State, l: &Live, bad: usize, sys: &Sys) -> u32 {
     if field == HEADLINE {
         return match s { State::Reset => RED, State::Watch | State::Recovering => AMBER, _ => LETTER };
     }
@@ -500,11 +649,14 @@ fn field_colour(field: (usize, usize), s: State, l: &Live, bad: usize) -> u32 {
     if field == BAD {
         return if s == State::Reset { RED } else if bad > 0 { AMBER } else { LETTER };
     }
+    if field == BATTERY {
+        return match sys.battery { Some((p, false)) if p < 10 => RED, Some((p, false)) if p < 20 => AMBER, _ => LETTER };
+    }
     LETTER
 }
 
-fn colours(s: State, l: &Live, bad: usize) -> [u32; 5] {
-    FIELDS.map(|f| field_colour(f, s, l, bad))
+fn colours(s: State, l: &Live, bad: usize, sys: &Sys) -> [u32; 11] {
+    FIELDS.map(|f| field_colour(f, s, l, bad, sys))
 }
 
 unsafe fn frame(p: &Painter, w: i32, h: i32) {
@@ -538,15 +690,18 @@ unsafe fn draw_board(p: &Painter, hour: &[Min; 60], now: u64, board: &Board, w: 
     cells(HEADLINE, 13, 11, BIG);
 
     let mut y = VERDICT_ROW;
+    let mut rows = Vec::new();
     if on(settings::READINGS) {
-        p.label("LOSS 5 MIN", 13, y, 70, LEFT);
-        p.label("PING MS", 90, y, 60, LEFT);
-        p.label("ROUTER MS", 150, y, 60, LEFT);
-        p.label("BAD / HR", 214, y, 60, LEFT);
-        cells(LOSS, 13, y + 11, SMALL);
-        cells(PING, 90, y + 11, SMALL);
-        cells(ROUTER_CELLS, 150, y + 11, SMALL);
-        cells(BAD, 214, y + 11, SMALL);
+        rows.push(vec![(LOSS, "LOSS 5 MIN"), (PING, "PING MS"), (ROUTER_CELLS, "ROUTER MS"), (BAD, "BAD / HR")]);
+    }
+    let charging = SYS.lock().unwrap().battery.is_some_and(|b| b.1);
+    let system = system_fields(if charging { "CHARGING %" } else { "BATTERY %" });
+    rows.extend(system.chunks(4).map(|c| c.to_vec()));
+    for row in rows {
+        for (k, (field, name)) in row.into_iter().enumerate() {
+            p.label(name, COLUMNS[k], y, 66, LEFT);
+            cells(field, COLUMNS[k], y + 11, SMALL);
+        }
         y += READINGS_ROW;
     }
     if !on(settings::STRIP) { return }
@@ -591,8 +746,9 @@ unsafe fn refresh(hwnd: H) {
     let now = now_min();
     let v = verdict(&hour, now);
     let (s, l) = (state(&v), live(&hour, now));
+    let sys = *SYS.lock().unwrap();
     let mut board = BOARD.lock().unwrap();
-    if board.set(targets(s, &l, v.bad), colours(s, &l, v.bad), Instant::now()) {
+    if board.set(targets(s, &l, v.bad, &sys), colours(s, &l, v.bad, &sys), Instant::now()) {
         if on(settings::FLIP) { SetTimer(hwnd, 1, 30, null()); } else { board.snap() }
     }
     InvalidateRect(hwnd, null(), 0);
@@ -605,7 +761,7 @@ fn sample_hour(state: &str, now: u64) -> [Min; 60] {
         let m = now - i;
         let lost: [u8; 2] = match state {
             "reset" if i < 24 => heavy[(i % 10) as usize],
-            "watch" if i == 22 || i == 23 => [3, 2],
+            "watch" if i == 22 || i == 23 => [4, 3],
             _ if i == 12 || i == 41 => [1, 1],
             _ => [0, 0],
         };
@@ -620,6 +776,10 @@ fn sample_hour(state: &str, now: u64) -> [Min; 60] {
 
 unsafe fn render(state_name: &str, out: &str, flipping: bool) {
     let dpi = 168;
+    if state_name == "system" {
+        for i in [settings::DOWN_UP, settings::CPU, settings::RAM, settings::GPU, settings::BATTERY] { settings::set(i, 1) }
+        *SYS.lock().unwrap() = Sys { down: Some(212.4), up: Some(8.73), cpu: Some(23.0), ram: Some(61.0), gpu: Some(7.0), battery: Some((17, false)) };
+    }
     let (w, h) = if state_name == "settings" { settings::size(dpi) } else { size_for(dpi) };
     let dc = CreateCompatibleDC(GetDC(null_mut()));
     let mut info = [0u32; 10];
@@ -635,11 +795,12 @@ unsafe fn render(state_name: &str, out: &str, flipping: bool) {
     let hour = sample_hour(state_name, now);
     let v = verdict(&hour, now);
     let (s, l) = (state(&v), live(&hour, now));
+    let sys = *SYS.lock().unwrap();
     let mut board = BLANK_BOARD;
-    board.set(targets(s, &l, v.bad), colours(s, &l, v.bad), Instant::now());
+    board.set(targets(s, &l, v.bad, &sys), colours(s, &l, v.bad, &sys), Instant::now());
     while board.tick() {}
     if flipping {
-        board.set(targets(State::Watch, &l, v.bad), colours(s, &l, v.bad), Instant::now());
+        board.set(targets(State::Watch, &l, v.bad, &sys), colours(s, &l, v.bad, &sys), Instant::now());
         for _ in 0..3 { board.tick(); }
     }
     if state_name == "settings" {
@@ -656,10 +817,17 @@ fn scale(dpi: u32) -> f32 {
     dpi as f32 / 96.0 * get(settings::SIZE) as f32 / 100.0
 }
 
+fn system_fields(battery: &'static str) -> Vec<((usize, usize), &'static str)> {
+    [(settings::DOWN_UP, DOWN, "DOWN MBPS"), (settings::DOWN_UP, UP, "UP MBPS"), (settings::CPU, CPU, "CPU %"),
+        (settings::RAM, RAM, "RAM %"), (settings::GPU, GPU, "GPU %"), (settings::BATTERY, BATTERY, battery)]
+        .into_iter().filter(|r| on(r.0)).map(|r| (r.1, r.2)).collect()
+}
+
 fn size_for(dpi: u32) -> (i32, i32) {
     let s = scale(dpi);
     let mut h = VERDICT_ROW;
     if on(settings::READINGS) { h += READINGS_ROW }
+    h += READINGS_ROW * system_fields("").len().div_ceil(4) as i32;
     if on(settings::STRIP) { h += STRIP_ROW }
     ((BW as f32 * s).round() as i32, (h as f32 * s).round() as i32)
 }
@@ -710,7 +878,13 @@ unsafe fn place(hwnd: H) {
         Some((it.next()??, it.next()??))
     });
     let (x, y) = match saved {
-        Some((x, y)) if !MonitorFromPoint(Point { x, y }, 0).is_null() => (x, y),
+        Some((x, y)) if !MonitorFromPoint(Point { x, y }, 0).is_null() => {
+            let mut info: MonitorInfo = zeroed();
+            info.size = size_of::<MonitorInfo>() as u32;
+            GetMonitorInfoW(MonitorFromPoint(Point { x, y }, 0), &mut info);
+            let work = info.work;
+            (x.min(work.r - w).max(work.l), y.min(work.b - h).max(work.t))
+        }
         _ => {
             let mut work: Rect = zeroed();
             SystemParametersInfoW(0x30, 0, (&mut work as *mut Rect).cast(), 0);
@@ -831,6 +1005,7 @@ fn main() {
         RegisterClassW(&WndClass { style: 0, wndproc: settings::proc, cls_extra: 0, wnd_extra: 0, inst, icon,
             cursor: arrow, background: null_mut(), menu: null(), class: page_class.as_ptr() });
         std::thread::spawn(pinger);
+        std::thread::spawn(sampler);
 
         while !CLOSED.load(Relaxed) {
             let desktop = desktop_window();
@@ -1000,13 +1175,27 @@ extern "system" {
     fn CreateMutexW(attrs: *const c_void, owner: i32, name: *const u16) -> H;
     fn GetLastError() -> u32;
     fn GetModuleHandleW(name: *const u16) -> H;
+    fn GetSystemTimes(idle: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+    fn GlobalMemoryStatusEx(status: *mut c_void) -> i32;
+    fn GetSystemPowerStatus(status: *mut c_void) -> i32;
 }
 #[link(name = "iphlpapi")]
 extern "system" {
     fn IcmpCreateFile() -> H;
     fn IcmpSendEcho(h: H, dest: u32, data: *const c_void, size: u16, opts: *const c_void, reply: *mut c_void, reply_size: u32, timeout: u32) -> u32;
     fn GetBestRoute(dest: u32, source: u32, row: *mut u32) -> u32;
+    fn GetBestInterface(dest: u32, index: *mut u32) -> u32;
+    fn GetIfEntry(row: *mut c_void) -> u32;
 }
+#[link(name = "pdh")]
+extern "system" {
+    fn PdhOpenQueryW(source: *const u16, user: usize, query: *mut H) -> u32;
+    fn PdhAddEnglishCounterW(query: H, path: *const u16, user: usize, counter: *mut H) -> u32;
+    fn PdhCollectQueryData(query: H) -> u32;
+    fn PdhGetFormattedCounterArrayW(counter: H, format: u32, size: *mut u32, count: *mut u32, items: *mut c_void) -> u32;
+    fn PdhCloseQuery(query: H) -> u32;
+}
+const PDH_FMT_DOUBLE: u32 = 0x200;
 #[link(name = "dwmapi")]
 extern "system" {
     fn DwmSetWindowAttribute(h: H, attr: u32, value: *const c_void, size: u32) -> i32;
@@ -1066,32 +1255,49 @@ mod tests {
 
     #[test]
     fn board() {
+        let none = Sys { down: None, up: None, cpu: None, ram: None, gpu: None, battery: None };
         let l = Live { loss_pct: Some(13.4), ping_ms: Some(69), router_ms: Some(4), router_dropping: false };
-        let t = targets(State::Reset, &l, 20);
-        assert_eq!(t.iter().collect::<String>(), "RESET     13% 69  420");
+        let t = targets(State::Reset, &l, 20, &none);
+        assert_eq!(t.iter().take(21).collect::<String>(), "RESET     13% 69  420");
+        assert_eq!(t[21..].iter().collect::<String>(), "  --  -- -- -- -- --");
         let calm = Live { loss_pct: Some(0.4), ..l };
-        assert_eq!(targets(State::Clean, &calm, 0).iter().collect::<String>(), "CLEAN    0.4% 69  4 0");
+        assert_eq!(targets(State::Clean, &calm, 0, &none).iter().take(21).collect::<String>(), "CLEAN    0.4% 69  4 0");
 
         let edge = Live { loss_pct: Some(9.96), ..l };
-        assert_eq!(targets(State::Watch, &edge, 1).iter().collect::<String>(), "WATCH     10% 69  4 1");
-        assert_eq!(field_colour(LOSS, State::Watch, &edge, 1), RED);
-        assert_eq!(targets(State::Reset, &Live { loss_pct: Some(99.7), ..l }, 3)[LOSS.0..LOSS.0 + 4], ['1', '0', '0', '%']);
+        assert_eq!(targets(State::Watch, &edge, 1, &none).iter().take(21).collect::<String>(), "WATCH     10% 69  4 1");
+        assert_eq!(field_colour(LOSS, State::Watch, &edge, 1, &none), RED);
+        assert_eq!(targets(State::Reset, &Live { loss_pct: Some(99.7), ..l }, 3, &none)[LOSS.0..LOSS.0 + 4], ['1', '0', '0', '%']);
 
         let mut b = BLANK_BOARD;
         let start = Instant::now();
-        b.set(t, colours(State::Reset, &l, 20), start);
+        b.set(t, colours(State::Reset, &l, 20, &none), start);
         let mut frames = 0;
         while b.tick() { frames += 1 }
         assert_eq!(b.shown, t);
         assert!(frames < 60, "settled in {frames} frames");
 
         let fine = Live { ping_ms: Some(70), loss_pct: Some(1.0), ..l };
-        let next = targets(State::Watch, &fine, 20);
-        b.set(next, colours(State::Watch, &fine, 20), start + Duration::from_secs(3));
+        let next = targets(State::Watch, &fine, 20, &none);
+        b.set(next, colours(State::Watch, &fine, 20, &none), start + Duration::from_secs(3));
         assert_eq!((b.target[0], b.colour[0]), ('W', AMBER));
         assert_eq!((b.target[PING.0 + 2], b.colour[1]), ('9', RED));
-        b.set(next, colours(State::Watch, &fine, 20), start + Duration::from_secs(10));
+        b.set(next, colours(State::Watch, &fine, 20, &none), start + Duration::from_secs(10));
         assert_eq!((b.target[PING.0 + 2], b.colour[1]), ('0', LETTER));
+    }
+
+    #[test]
+    fn system_readings() {
+        assert_eq!([rate(Some(0.04)), rate(Some(9.96)), rate(Some(87.4)), rate(Some(940.0)), rate(Some(1234.0)), rate(Some(12000.0))],
+            ["0.0", "10", "87", "940", "1.2G", "12G"]);
+        assert_eq!([percent(Some(99.6)), percent(Some(104.0)), percent(None)], ["100", "100", "--"]);
+        let sys = Sys { down: Some(212.4), up: Some(8.73), cpu: Some(23.0), ram: Some(61.0), gpu: None, battery: Some((9, false)) };
+        let l = Live { loss_pct: None, ping_ms: None, router_ms: None, router_dropping: false };
+        assert_eq!(targets(State::Clean, &l, 0, &sys)[21..].iter().collect::<String>(), " 212 8.7 23 61 --  9");
+        assert_eq!(field_colour(BATTERY, State::Clean, &l, 0, &sys), RED);
+        assert_eq!(field_colour(BATTERY, State::Clean, &l, 0, &Sys { battery: Some((9, true)), ..sys }), LETTER);
+        assert_eq!(field_colour(BATTERY, State::Clean, &l, 0, &Sys { battery: Some((15, false)), ..sys }), AMBER);
+        assert_eq!(ease(Some(10.0), Some(20.0)), Some(13.0));
+        assert_eq!(ease(None, Some(20.0)), Some(20.0));
     }
 
     #[test]
