@@ -257,7 +257,6 @@ fn pinger() {
         if now_min() != saved {
             saved = now_min();
             save_hour();
-            unsafe { SetProcessWorkingSetSize(-1isize as H, usize::MAX, usize::MAX); }
             if let Ok(s) = bind() {
                 socket = s;
                 pending.clear();
@@ -1020,12 +1019,13 @@ fn main() {
         let inst = GetModuleHandleW(null());
         let class = wide("NetwatchWidget");
         let page_class = wide("NetwatchSettings");
-        let icon = LoadIconW(inst, 1 as *const u16);
+        ImmDisableIME(u32::MAX);
         let arrow = LoadCursorW(null_mut(), 32512);
-        RegisterClassW(&WndClass { style: 0, wndproc, cls_extra: 0, wnd_extra: 0, inst, icon,
+        RegisterClassW(&WndClass { style: 0, wndproc, cls_extra: 0, wnd_extra: 0, inst, icon: null_mut(),
             cursor: arrow, background: null_mut(), menu: null(), class: class.as_ptr() });
-        RegisterClassW(&WndClass { style: 0, wndproc: settings::proc, cls_extra: 0, wnd_extra: 0, inst, icon,
+        RegisterClassW(&WndClass { style: 0, wndproc: settings::proc, cls_extra: 0, wnd_extra: 0, inst, icon: null_mut(),
             cursor: arrow, background: null_mut(), menu: null(), class: page_class.as_ptr() });
+        SetProcessWorkingSetSizeEx(-1isize as H, 256 << 10, 2 << 20, 6);
         std::thread::spawn(pinger);
         std::thread::spawn(sampler);
 
@@ -1155,7 +1155,6 @@ extern "system" {
     fn TrackPopupMenu(m: H, flags: u32, x: i32, y: i32, r: i32, h: H, rc: *const Rect) -> i32;
     fn DestroyMenu(m: H) -> i32;
     fn GetWindow(h: H, cmd: u32) -> H;
-    fn LoadIconW(inst: H, name: *const u16) -> H;
     fn AllowSetForegroundWindow(pid: u32) -> i32;
     fn SetCursor(cursor: H) -> H;
     fn ScreenToClient(h: H, p: *mut Point) -> i32;
@@ -1200,7 +1199,7 @@ extern "system" {
     fn GetSystemTimes(idle: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
     fn GlobalMemoryStatusEx(status: *mut c_void) -> i32;
     fn GetSystemPowerStatus(status: *mut c_void) -> i32;
-    fn SetProcessWorkingSetSize(process: H, min: usize, max: usize) -> i32;
+    fn SetProcessWorkingSetSizeEx(process: H, min: usize, max: usize, flags: u32) -> i32;
 }
 #[link(name = "iphlpapi")]
 extern "system" {
@@ -1219,6 +1218,10 @@ extern "system" {
     fn PdhCloseQuery(query: H) -> u32;
 }
 const PDH_FMT_DOUBLE: u32 = 0x200;
+#[link(name = "imm32")]
+extern "system" {
+    fn ImmDisableIME(thread: u32) -> i32;
+}
 #[link(name = "dwmapi")]
 extern "system" {
     fn DwmSetWindowAttribute(h: H, attr: u32, value: *const c_void, size: u32) -> i32;

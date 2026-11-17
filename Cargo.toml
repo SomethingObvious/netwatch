@@ -1,6 +1,6 @@
 [package]
 name = "netwatch"
-version = "1.2.4"
+version = "1.2.5"
 edition = "2021"
 description = "A desktop board that says when packet loss means it's time to restart the router"
 license = "MIT"

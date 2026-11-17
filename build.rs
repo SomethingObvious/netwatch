@@ -14,6 +14,8 @@ fn resource(out: &mut Vec<u8>, kind: u16, id: u16, flags: u16, data: &[u8]) {
 fn main() {
     println!("cargo:rerun-if-changed=netwatch.ico");
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") { return }
+    println!("cargo:rustc-link-arg-bins=/DELAYLOAD:pdh.dll");
+    println!("cargo:rustc-link-arg-bins=delayimp.lib");
     let ico = std::fs::read("netwatch.ico").expect("netwatch.ico sits next to Cargo.toml");
     let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
     let mut res = vec![0, 0, 0, 0, 0x20, 0, 0, 0, 0xFF, 0xFF, 0, 0, 0xFF, 0xFF, 0, 0];

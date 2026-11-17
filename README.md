@@ -10,7 +10,7 @@ The top row is the verdict, from CLEAN and FINE through WATCH to RESET, then REC
 
 There are also rows for the PC itself, with download and upload speed, CPU and RAM, and GPU and battery, all off until you turn them on. GPU reads the same as Task Manager.
 
-It sits on the desktop under your windows, so it never covers a game, and uses about 2 MB of memory and 460 bytes a second. The GPU row costs another 4 MB or so, as Windows' counters for it are fairly heavy.
+It sits on the desktop under your windows, so it never covers a game, and uses well under 1 MB of memory and 460 bytes a second. The GPU row costs another 4 MB or so, as Windows' counters for it are fairly heavy.
 Click the board, or open Netwatch again while it's running, for the settings. They cover what counts as bad and what the board shows, and there's Clear the Hour for after a restart. Drag the board to move it.
 
 ## Building
