@@ -241,12 +241,14 @@ fn router_pinger() {
 
 fn pinger() {
     std::thread::spawn(router_pinger);
-    let socket = loop {
+    let bind = || loop {
         match UdpSocket::bind(("0.0.0.0", 0)) {
             Ok(s) => break s,
             Err(_) => std::thread::sleep(Duration::from_secs(1)),
         }
     };
+    let mut socket = bind();
+    let mut silent = 0u32;
     let to = |i: usize| Ipv4Addr::from(HOSTS[i]);
     let mut id = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as u16);
     let mut pending: Vec<(u16, usize, Instant)> = Vec::new();
@@ -288,8 +290,13 @@ fn pinger() {
         pending.retain(|&(_, host, at)| {
             if now - at < LOOKUP_WAIT { return true }
             if !syncing { record(host, true, 0) }
+            silent += 1;
             false
         });
+        if silent >= 40 {
+            socket = bind();
+            silent = 0;
+        }
         let wait = next_send.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
         if socket.set_read_timeout(Some(wait)).is_err() { continue }
         match socket.recv_from(&mut buf) {
@@ -298,6 +305,7 @@ fn pinger() {
                 if let Some(k) = pending.iter().position(|&(pid, host, _)| pid == reply && from.ip() == to(host)) {
                     let (_, host, at) = pending.swap_remove(k);
                     syncing_until = None;
+                    silent = 0;
                     record(host, false, at.elapsed().as_millis() as u32);
                 }
             }
