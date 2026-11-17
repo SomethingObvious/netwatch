@@ -4,7 +4,8 @@ use std::io::Write;
 use std::mem::{size_of, zeroed};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -113,7 +114,7 @@ fn live(hour: &[Min; 60], now: u64) -> Live {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Hash)]
 enum State { Measuring, Clean, Fine, Watch, Recovering, Reset }
 
 fn state(v: &Verdict) -> State {
@@ -587,7 +588,7 @@ const BIG: (i32, i32, i32) = (22, 38, 24);
 const COLUMNS: [i32; 4] = [13, 81, 149, 217];
 const SMALL: (i32, i32, i32) = (14, 22, 16);
 
-struct Painter { dc: H, s: f32 }
+struct Painter { dc: H, s: f32, clip: Rect }
 
 impl Painter {
     fn px(&self, v: i32) -> i32 { (v as f32 * self.s).round() as i32 }
@@ -615,7 +616,20 @@ impl Painter {
     }
 
     unsafe fn text_px(&self, s: &str, r: Rect, face: &str, size: i32, colour: u32, align: u32, tracking: i32) {
-        let font = CreateFontW(-size, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 5, 0, wide(face).as_ptr());
+        let c = self.clip;
+        if r.r + size < c.l || r.l - size > c.r || r.b < c.t || r.t > c.b { return }
+        let mut fonts = FONTS.lock().unwrap();
+        let font = match fonts.iter().find(|f| f.0 == face && f.1 == size) {
+            Some(f) => f.2 as H,
+            None => {
+                if fonts.len() >= 16 {
+                    for f in fonts.drain(..) { DeleteObject(f.2 as H); }
+                }
+                let font = CreateFontW(-size, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 5, 0, wide(face).as_ptr());
+                fonts.push((face.to_string(), size, font as isize));
+                font
+            }
+        };
         let old = SelectObject(self.dc, font);
         SetTextColor(self.dc, colour);
         SetTextCharacterExtra(self.dc, tracking);
@@ -624,7 +638,6 @@ impl Painter {
         DrawTextW(self.dc, text.as_ptr(), -1, &mut r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_NOCLIP | align);
         SetTextCharacterExtra(self.dc, 0);
         SelectObject(self.dc, old);
-        DeleteObject(font);
     }
 
     unsafe fn label(&self, s: &str, x: i32, y: i32, w: i32, align: u32) {
@@ -705,7 +718,9 @@ unsafe fn draw_board(p: &Painter, hour: &[Min; 60], now: u64, board: &Board, w: 
         let colour = board.colour[FIELDS.iter().position(|&f| f == field).unwrap_or(0)];
         for i in 0..field.1 {
             let c = field.0 + i;
-            p.flap(x + i as i32 * size.2, y, size, board.shown[c], board.old[c], board.half[c], colour);
+            let x = x + i as i32 * size.2;
+            CELL_RECTS.lock().unwrap()[c] = Rect { l: p.px(x), t: p.px(y), r: p.px(x + size.0), b: p.px(y + size.1) };
+            p.flap(x, y, size, board.shown[c], board.old[c], board.half[c], colour);
         }
     };
     cells(HEADLINE, 13, 11, BIG);
@@ -732,18 +747,27 @@ unsafe fn draw_board(p: &Painter, hour: &[Min; 60], now: u64, board: &Board, w: 
     p.label("NOW", 210, strip, 60, RIGHT);
     let (x0, y0, width, height) = (p.px(13), p.px(strip + 12), p.px(BW - 26), p.px(10));
     let gap = p.px(1).max(1);
-    for i in 0..60u64 {
-        let m = now + i - 59;
-        let minute = hour[(m % 60) as usize];
-        let colour = if minute.stamp != m || minute.sent() == 0 { rgb(17, 17, 19) }
-            else if minute.lost() == 0 { rgb(48, 50, 54) }
-            else if minute.lost() < get(settings::BAD_LOST) { LABEL }
-            else if s == State::Reset { RED } else { AMBER };
+    for (i, colour) in strip_colours(hour, now, s).into_iter().enumerate() {
         let x = x0 + i as i32 * width / 60;
         let x1 = x0 + (i as i32 + 1) * width / 60 - gap;
         p.fill(x, y0, x1, y0 + height, colour);
     }
 }
+
+fn strip_colours(hour: &[Min; 60], now: u64, s: State) -> [u32; 60] {
+    std::array::from_fn(|i| {
+        let m = now + i as u64 - 59;
+        let minute = hour[(m % 60) as usize];
+        if minute.stamp != m || minute.sent() == 0 { rgb(17, 17, 19) }
+        else if minute.lost() == 0 { rgb(48, 50, 54) }
+        else if minute.lost() < get(settings::BAD_LOST) { LABEL }
+        else if s == State::Reset { RED } else { AMBER }
+    })
+}
+
+static DRAWN: AtomicU64 = AtomicU64::new(0);
+static CELL_RECTS: Mutex<[Rect; CELLS]> = Mutex::new([Rect { l: 0, t: 0, r: 0, b: 0 }; CELLS]);
+static FONTS: Mutex<Vec<(String, i32, isize)>> = Mutex::new(Vec::new());
 
 unsafe fn paint(hwnd: H, s: f32, draw: impl Fn(&Painter, i32, i32)) {
     let mut ps: PaintStruct = zeroed();
@@ -754,7 +778,7 @@ unsafe fn paint(hwnd: H, s: f32, draw: impl Fn(&Painter, i32, i32)) {
     let bmp = CreateCompatibleBitmap(screen, client.r, client.b);
     let old_bmp = SelectObject(dc, bmp);
     SetBkMode(dc, 1);
-    draw(&Painter { dc, s }, client.r, client.b);
+    draw(&Painter { dc, s, clip: ps.rc }, client.r, client.b);
     BitBlt(screen, 0, 0, client.r, client.b, dc, 0, 0, 0x00CC_0020);
     SelectObject(dc, old_bmp);
     DeleteObject(bmp);
@@ -772,7 +796,10 @@ unsafe fn refresh(hwnd: H) {
     if board.set(targets(s, &l, v.bad, &sys), colours(s, &l, v.bad, &sys), Instant::now()) {
         if on(settings::FLIP) { SetTimer(hwnd, 1, 30, null()); } else { board.snap() }
     }
-    InvalidateRect(hwnd, null(), 0);
+    let mut key = std::hash::DefaultHasher::new();
+    (s, board.target, board.colour, strip_colours(&hour, now, s), sys.battery.is_some_and(|b| b.1)).hash(&mut key);
+    let key = key.finish();
+    if DRAWN.swap(key, Relaxed) != key { InvalidateRect(hwnd, null(), 0); }
 }
 
 fn sample_hour(state: &str, now: u64) -> [Min; 60] {
@@ -825,9 +852,9 @@ unsafe fn render(state_name: &str, out: &str, flipping: bool) {
         for _ in 0..3 { board.tick(); }
     }
     if state_name == "settings" {
-        settings::draw(&Painter { dc, s: dpi as f32 / 96.0 }, w, h);
+        settings::draw(&Painter { dc, s: dpi as f32 / 96.0, clip: Rect { l: 0, t: 0, r: w, b: h } }, w, h);
     } else {
-        draw_board(&Painter { dc, s: scale(dpi) }, &hour, now, &board, w, h);
+        draw_board(&Painter { dc, s: scale(dpi), clip: Rect { l: 0, t: 0, r: w, b: h } }, &hour, now, &board, w, h);
     }
     GdiFlush();
     let _ = std::fs::write(out, std::slice::from_raw_parts(bits, (w * h * 4) as usize));
@@ -928,8 +955,13 @@ unsafe extern "system" fn wndproc(hwnd: H, msg: u32, wp: usize, lp: isize) -> is
         WM_APP => { refresh(hwnd); 0 }
         WM_OPEN_SETTINGS => { settings::open(hwnd); 0 }
         WM_TIMER => {
-            if !BOARD.lock().unwrap().tick() { KillTimer(hwnd, 1); }
-            InvalidateRect(hwnd, null(), 0);
+            let mut board = BOARD.lock().unwrap();
+            let before = (board.shown, board.half);
+            if !board.tick() { KillTimer(hwnd, 1); }
+            let rects = CELL_RECTS.lock().unwrap();
+            for i in (0..CELLS).filter(|&i| (board.shown[i], board.half[i]) != (before.0[i], before.1[i])) {
+                InvalidateRect(hwnd, &rects[i], 0);
+            }
             0
         }
         WM_LBUTTONDOWN => {
