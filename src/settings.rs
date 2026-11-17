@@ -280,7 +280,6 @@ pub unsafe extern "system" fn proc(hwnd: H, msg: u32, wp: usize, lp: isize) -> i
 
 pub unsafe fn draw(p: &Painter, w: i32, h: i32) {
     frame(p, w, h);
-    let _ = (w, h);
     let list = items();
     let hover = HOVER.load(Relaxed);
     let lit = |hit: Hit| hover >= 0 && list.get(hover as usize).is_some_and(|x| x.0 == hit);

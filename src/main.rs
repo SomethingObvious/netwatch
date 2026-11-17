@@ -196,12 +196,9 @@ const HOST_UNREACHABLE: u32 = 11003;
 const RESET_OFFLINE: Duration = Duration::from_secs(30);
 const SYNC_GRACE: Duration = Duration::from_secs(180);
 
-fn dns_query(id: u16) -> [u8; 29] {
-    let mut q = [0u8; 29];
+fn dns_query(id: u16) -> [u8; 22] {
+    let mut q = *b"\0\0\x01\0\0\x01\0\0\0\0\0\0\x01t\x02co\0\0\x01\0\x01";
     q[..2].copy_from_slice(&id.to_be_bytes());
-    q[2] = 1;
-    q[5] = 1;
-    q[12..].copy_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
     q
 }
 
@@ -241,14 +238,13 @@ fn router_pinger() {
 
 fn pinger() {
     std::thread::spawn(router_pinger);
-    let bind = || loop {
-        match UdpSocket::bind(("0.0.0.0", 0)) {
+    let bind = || UdpSocket::bind(("0.0.0.0", 0));
+    let mut socket = loop {
+        match bind() {
             Ok(s) => break s,
             Err(_) => std::thread::sleep(Duration::from_secs(1)),
         }
     };
-    let mut socket = bind();
-    let mut silent = 0u32;
     let to = |i: usize| Ipv4Addr::from(HOSTS[i]);
     let mut id = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as u16);
     let mut pending: Vec<(u16, usize, Instant)> = Vec::new();
@@ -258,13 +254,18 @@ fn pinger() {
     let mut saved = now_min();
     let mut buf = [0u8; 512];
     loop {
+        if now_min() != saved {
+            saved = now_min();
+            save_hour();
+            unsafe { SetProcessWorkingSetSize(-1isize as H, usize::MAX, usize::MAX); }
+            if let Ok(s) = bind() {
+                socket = s;
+                pending.clear();
+            }
+        }
         let now = Instant::now();
         if now >= next_send {
             next_send = (next_send + LOOKUP_EVERY).max(now);
-            if now_min() != saved {
-                saved = now_min();
-                save_hour();
-            }
             let mut sent_any = false;
             for i in 0..2 {
                 id = id.wrapping_add(1);
@@ -290,13 +291,8 @@ fn pinger() {
         pending.retain(|&(_, host, at)| {
             if now - at < LOOKUP_WAIT { return true }
             if !syncing { record(host, true, 0) }
-            silent += 1;
             false
         });
-        if silent >= 40 {
-            socket = bind();
-            silent = 0;
-        }
         let wait = next_send.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
         if socket.set_read_timeout(Some(wait)).is_err() { continue }
         match socket.recv_from(&mut buf) {
@@ -305,7 +301,6 @@ fn pinger() {
                 if let Some(k) = pending.iter().position(|&(pid, host, _)| pid == reply && from.ip() == to(host)) {
                     let (_, host, at) = pending.swap_remove(k);
                     syncing_until = None;
-                    silent = 0;
                     record(host, false, at.elapsed().as_millis() as u32);
                 }
             }
@@ -506,11 +501,10 @@ fn targets(s: State, l: &Live, bad: usize, sys: &Sys) -> [char; CELLS] {
 }
 
 fn drum_step(c: char, target: char) -> char {
-    let drum: Vec<char> = DRUM.chars().collect();
-    let at = drum.iter().position(|&d| d == c).unwrap_or(0);
-    let to = drum.iter().position(|&d| d == target).unwrap_or(0);
-    let distance = (to + drum.len() - at) % drum.len();
-    if distance > 8 { drum[(to + drum.len() - 8) % drum.len()] } else { drum[(at + 1) % drum.len()] }
+    let (drum, n) = (DRUM.as_bytes(), DRUM.len());
+    let at = drum.iter().position(|&d| d as char == c).unwrap_or(0);
+    let to = drum.iter().position(|&d| d as char == target).unwrap_or(0);
+    (if (to + n - at) % n > 8 { drum[(to + n - 8) % n] } else { drum[(at + 1) % n] }) as char
 }
 
 struct Board {
@@ -1206,6 +1200,7 @@ extern "system" {
     fn GetSystemTimes(idle: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
     fn GlobalMemoryStatusEx(status: *mut c_void) -> i32;
     fn GetSystemPowerStatus(status: *mut c_void) -> i32;
+    fn SetProcessWorkingSetSize(process: H, min: usize, max: usize) -> i32;
 }
 #[link(name = "iphlpapi")]
 extern "system" {
