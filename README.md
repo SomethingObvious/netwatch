@@ -2,7 +2,7 @@
 
 A small desktop board for Windows that tells you whether your internet has been dropping packets badly enough in the last hour to be worth restarting the router.
 
-![The board when the line is fine, worth watching, and due for a reset](board.png)
+![The board when the line is fine, worth watching, and due for a reset](assets/board.png)
 
 Twice a second it sends a tiny DNS lookup to 1.1.1.1 and 8.8.8.8, and once a second it pings your router. A minute counts as bad when both hosts missed lookups in it and the two together missed five, which is what a burst of a couple of seconds does to a game. The board says RESET after five bad minutes within 15, since a line that stutters now and then is still playable and one that misses minute after minute isn't. The lookups go over UDP like game traffic, because pings get throttled on their own. A router that answers while the internet doesn't means the loss is past it.
 
