@@ -526,15 +526,15 @@ static BOARD: Mutex<Board> = Mutex::new(BLANK_BOARD);
 impl Board {
     fn set(&mut self, t: [char; CELLS], colours: [u32; 11], at: Instant) -> bool {
         let refresh = Duration::from_secs(get(settings::REFRESH) as u64);
-        let numbers_due = self.numbers_at.map_or(true, |n| at - n >= refresh);
+        let numbers_due = self.numbers_at.is_none_or(|n| at - n >= refresh);
         if numbers_due { self.numbers_at = Some(at) }
         for (k, (start, len)) in FIELDS.into_iter().enumerate() {
             if start != HEADLINE.0 && !numbers_due { continue }
             self.colour[k] = colours[k];
-            for i in start..start + len {
-                if self.target[i] != t[i] {
-                    self.target[i] = t[i];
-                    self.wait[i] = 2 * (i - start) as u8;
+            for (i, (target, &new)) in self.target[start..start + len].iter_mut().zip(&t[start..start + len]).enumerate() {
+                if *target != new {
+                    *target = new;
+                    self.wait[start + i] = 2 * i as u8;
                 }
             }
         }

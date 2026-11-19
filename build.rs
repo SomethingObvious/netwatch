@@ -8,7 +8,7 @@ fn resource(out: &mut Vec<u8>, kind: u16, id: u16, flags: u16, data: &[u8]) {
     out.extend(0x0409u16.to_le_bytes());
     out.extend([0u8; 8]);
     out.extend(data);
-    while out.len() % 4 != 0 { out.push(0) }
+    while !out.len().is_multiple_of(4) { out.push(0) }
 }
 
 fn main() {
